@@ -1,4 +1,4 @@
-##### Machine Learning fits
+##### Machine Learning Model Fits
 ##### Daniel Dempsey
 
 ### Read in libraries
@@ -7,20 +7,25 @@ library( randomForest ) # Fit random forest model
 library( SHAPforxgboost ) # For shapley value plots
 library( treeshap ) # To compute shapley values
 library( readr ) # Load in csv files
-library( readxl ) # Load in excel files
 library( dplyr ) # Data frame manipulation tools
 library( tidyr ) # Data frame manipulation tools
 library( pROC ) # Computing ROC curves and AUC
-library( parallel ) # Parallel computation
+library( Gmedian ) # Computing the geometric median 
 library( tictoc ) # For timing code
 library( caret ) # Cross validation and random forest tools
+library( mice ) # Data imputation tools
 library( data.table ) # Used when computing Shapley values
 library( ggplot2 ) # Plotting functionality
-library( ggridges ) # For making joyplots/ridgeplots
 mycol <- c( '#56B4E9', '#E69F00' )
 
 ### Function to make directories if they don't already exist
-mkdir <- function( x ) {
+mkdir <- function( x, safe = TRUE, safe_dir = 'HD_BSI' ) {
+  if ( safe ) {
+    where_now <- sub( ".*/", "", getwd() )
+    if ( where_now != safe_dir ) {
+      stop( paste0("You are trying to create a folder where you don't want to! Move to the ", safe_dir, " directory.") )
+    }
+  }
   dir_split <- strsplit( x, '/' )[[1]]
   current_dir <- ''
   for ( i in 1:length(dir_split) ) {
@@ -86,236 +91,259 @@ randomForest2.unify <- function (rf_model, data) {
   return(set_reference_dataset(ret, as.data.frame(data)))
 }
 
+### Function for missing data imputation via partial mean matching
+# A lot of this is taken from the mice package internals
+dynamic_pmm_within <- function( ci, dat, ti, donors = 5, ridge = 1e-05 , ... ) {
+  
+  # Prepare data
+  y <- dat[, ci]
+  y_obs <- !is.na( y )
+  x_all <- cbind( 1, dat[, -ci] )
+  x <- x_all[, colSums(is.na(x_all)) == 0]
+  
+  # Ridge regression on training set only
+  x_train <- x[-ti, , drop = FALSE]
+  y_train <- y[-ti]
+  y_obs_train <- y_obs[-ti]
+  
+  p <- estimice( x_train[y_obs_train, , drop = FALSE], y_train[y_obs_train], ... )
+  sigma.star <- sqrt( sum((p$r)^2)/rchisq(1, p$df) )
+  beta.star <- p$c + ( t(chol(p$v) ) %*% rnorm( ncol(x)) ) * sigma.star
+  parm <- list( p$c, beta.star )
+  
+  # Matching on both sets
+  yhatobs <- x[y_obs, , drop = FALSE] %*% parm[[1]]
+  yhatmis <- x[!y_obs, , drop = FALSE] %*% parm[[2]]
+  idx <- matchindex( yhatobs, yhatmis, donors )
+  
+  # Return imputed values
+  y[!y_obs] <- y[y_obs][idx]
+  y
+  
+}
+
+### Function that applies imputation across entire dataset automatically
+dynamic_pmm <- function( X, ti, ... ) {
+  
+  X_imp <- X
+  mis_cols <- which( apply(X, 2, function(x) { any(is.na(x)) }) ) %>% sample
+  
+  for ( i in 1:length(mis_cols) ) {
+    X_imp[, mis_cols[i]] <- dynamic_pmm_within( mis_cols[i], X_imp, ti, ... )
+  }
+  
+  X_imp
+  
+}
+
+### Function to parse the shapley value results into an easier format
+# This was mostly written by ChatGPT-4o
+shap_convert <- function( shap_res ) {
+  
+  # Extract variable names and row indices
+  varnames <- colnames(shap_res[[1]])
+  row_indices <- seq_len(nrow(shap_res[[1]]))
+  
+  # Create a data frame with all combinations of varname and row_index
+  base_df <- expand.grid(
+    row_index = row_indices,
+    varname = varnames
+  )
+  
+  # Reorder to match the original layout (varname first, row_index second)
+  base_df <- base_df[, c("varname", "row_index")]
+  
+  # For each dataframe in the list, extract values in the correct order
+  get_values <- function(df) {
+    unlist(df[, varnames], use.names = FALSE)
+  }
+  
+  # Combine values from all dataframes
+  value_columns <- lapply(shap_res, get_values)
+  
+  # Bind them into the final dataframe
+  cbind(base_df, setNames(as.data.frame(value_columns), paste0("df", seq_along(shap_res))))
+  
+}
+
 
 ### Fitting function
 # Model mode = 1 corresponds to XGBoost, anything else is Random Forest
-fit_fun <- function( X, y, param_grid, model_mode = 1, num_folds, B = 1000, seed = 1 ) {
+fit_fun <- function( X, y, param_grid, model_mode = 1, outer_folds = nrow(X), 
+                     inner_folds = 10, seed = 1 ) {
   
   set.seed( seed )
   
   # set working directory
   if ( model_mode == 1 ) { directory <- 'XGBoost' }
   else { directory <- 'RandomForest' }
-  mkdir( directory )
+  mkdir( directory, safe_dir = 'Model_Fits' )
   setwd( directory )
-  
-  # Save parameter grid
-  grid_save <- as.data.frame( do.call( 'cbind', param_grid ) )
-  write_csv( grid_save, 'parameter_grid.csv' )
-  
-  # Prepare xgboost sets
-  if ( model_mode == 1 ) {
-    xgb_dat <- xgb.DMatrix( data = X, label = y )
-  }
   
   # Prepare parameter grid for cross-validation
   nrounds_ind <- which( names(param_grid) == 'nrounds' )
   all_param_grid <- expand.grid( param_grid )
-  all_param_grid <- split( all_param_grid, 1:nrow(all_param_grid) )
+  all_param_grid_split <- split( all_param_grid, 1:nrow(all_param_grid) )
   
-  # Cross validation settings
-  cv_fold_inds <- createFolds( as.factor(y), k = num_folds )
-  
-  # Run cross validation
-  ce_list <- auc_list <- list()
-  for ( i in 1:num_folds ) {
+  # Begin outer loop
+  outer_fold_inds <- createFolds( as.factor(y), k = outer_folds )
+  outer_preds_train_all <- outer_preds_test_all <- outer_shaps_all <- best_params_all <- list()
+  for ( i in 1:outer_folds ) {
     
-    # Select cross-validation set
-    X_cv_train <- X[-cv_fold_inds[[i]], ]
-    y_cv_train <- y[-cv_fold_inds[[i]]]
+    # Create outer sets
+    X_outer_train <- X[-outer_fold_inds[[i]], , drop = FALSE]
+    y_outer_train <- y[-outer_fold_inds[[i]]]
     
-    X_cv_test <- X[cv_fold_inds[[i]], , drop = FALSE]
-    y_cv_test <- y[cv_fold_inds[[i]]]
+    X_outer_test <- X[outer_fold_inds[[i]], , drop = FALSE]
+    y_outer_test <- y[outer_fold_inds[[i]]]
     
-    if (model_mode == 1) {
+    # Begin inner loop
+    inner_fold_inds <- createFolds( as.factor(y_outer_train), k = inner_folds )
+    all_test_preds <- matrix( 0, nrow = inner_folds, ncol = nrow(all_param_grid) )
+    for ( j in 1:inner_folds ) {
       
-      cv_train_xgb <- xgb.DMatrix( data = X_cv_train, label = y_cv_train )
-      cv_test_xgb <- xgb.DMatrix( data = X_cv_test, label = y_cv_test )
+      X_imp_inner <- dynamic_pmm( X_outer_train, inner_fold_inds[[j]] )
       
-      cv_fit <- lapply( all_param_grid, function(x) {
-        xgb.train( params = as.list(x[-nrounds_ind]), data = cv_train_xgb, 
-                   nrounds = x[[nrounds_ind]], verbose = 0 )
-      } )
+      # Create inner sets
+      X_inner_train <- X_imp_inner[-inner_fold_inds[[j]], , drop = FALSE]
+      y_inner_train <- y_outer_train[-inner_fold_inds[[j]]]
       
-      test_preds <- lapply( cv_fit, predict, newdata = cv_test_xgb )
+      X_inner_test <- X_outer_train[inner_fold_inds[[j]], , drop = FALSE]
+      y_inner_test <- y_outer_train[inner_fold_inds[[j]]]
       
+      # Observation weighting based on imbalance
+      weight_cv <- rep( 1, length(y_inner_train) )
+      weight_cv[y_inner_train == 1] <- sum( 1 - y_inner_train ) / sum( y_inner_train )
+      
+      # Fit the desired model
+      if (model_mode == 1) { # XGBoost
+        inner_train_xgb <- xgb.DMatrix( data = X_inner_train, label = y_inner_train, 
+                                        weight = weight_cv )
+        inner_test_xgb <- xgb.DMatrix( data = X_inner_test, label = y_inner_test )
+        cv_fit <- lapply( all_param_grid_split, function(x) {
+          xgb.train( params = as.list(x[-nrounds_ind]), data = inner_train_xgb, 
+                     nrounds = x[[nrounds_ind]], verbose = 0 )
+        } )
+        test_preds <- lapply( cv_fit, predict, newdata = inner_test_xgb )
+      }
+      else { # Random Forest
+        cv_fit <- lapply( all_param_grid_split, function(z) {
+          randomForest( x = X_inner_train, y = factor(y_inner_train),
+                        ntree = z$ntree, sampsize = z$sampsize,
+                        nodesize = z$nodesize, mtry = z$mtry ) 
+        } )
+        test_preds <- lapply( cv_fit, function(x) { predict( x, newdata = X_inner_test, type = 'prob' )[, 2] } )
+      }
+      ce_fold <- sapply( test_preds, function(x){ log_loss(x, y_inner_test) } )
+      all_test_preds[j, ] <- sapply( test_preds, function(x){ log_loss(x, y_inner_test) } )
     }
-    else {
-      
-      cv_fit <- lapply( all_param_grid, function(z) {
-        randomForest( x = X_cv_train, y = factor(y_cv_train),
-                      ntree = z$ntree, sampsize = z$sampsize,
-                      nodesize = z$nodesize, mtry = z$mtry ) 
-      } )
-      
-      test_preds <- lapply( cv_fit, function(x) { predict( x, newdata = X_cv_test, type = 'prob' )[, 2] } )
-      
+    
+    # Compile results of inner loop
+    ce_mean <- apply( all_test_preds, 2, mean )
+    best_ind <- which.min( ce_mean )
+    best_params_all[[i]] <- best_params <- all_param_grid_split[[best_ind]]
+    
+    # Remake outer set with imputed data
+    X_imp_outer <- dynamic_pmm( X, outer_fold_inds[[i]] )
+    X_outer_train <- X_imp_outer[-outer_fold_inds[[i]], ]
+    X_outer_test <- X_imp_outer[outer_fold_inds[[i]], , drop = FALSE]
+    
+    # Observation weighting based on imbalance
+    weight_cv <- rep( 1, length(y_outer_train) )
+    weight_cv[y_outer_train == 1] <- sum( 1 - y_outer_train ) / sum( y_outer_train )
+    
+    # Fit the desired model
+    if (model_mode == 1) { # XGBoost
+      outer_train_xgb <- xgb.DMatrix( data = X_outer_train, label = y_outer_train, 
+                                      weight = weight_cv )
+      outer_test_xgb <- xgb.DMatrix( data = X_outer_test, label = y_outer_test )
+      outer_fit <- xgb.train( params = as.list(best_params[-nrounds_ind]), 
+                              data = outer_train_xgb, nrounds = best_params[[nrounds_ind]] )
+      outer_preds_train <- predict( outer_fit, newdata = outer_train_xgb )
+      outer_preds_test <- predict( outer_fit, newdata = outer_test_xgb )
+      fit_unify <- xgboost.unify( outer_fit, X_outer_train )
+    }
+    else { # Random Forest
+      outer_fit <- randomForest( x = X_outer_train, y = factor(y_outer_train),
+                                 ntree = best_params$ntree, sampsize = best_params$sampsize,
+                                 nodesize = best_params$nodesize, mtry = best_params$mtry )
+      outer_preds_train <- predict( outer_fit, newdata = X_outer_train, type = 'prob' )[, 2]
+      outer_preds_test <- predict( outer_fit, newdata = X_outer_test, type = 'prob' )[, 2]
+      fit_unify <- randomForest2.unify( outer_fit, X_outer_train )
     }
     
-    #auc_list[[i]] <- sapply( test_preds, function(x){ roc( y_cv_test, x, direction = '<', quiet = TRUE )$auc } )
-    ce_list[[i]] <- sapply( test_preds, function(x){ log_loss(x, y_cv_test) } )
+    # Accuracy and Shapley values
+    outer_preds_train_all[[i]] <- data.frame( preds = outer_preds_train, true = y_outer_train )
+    outer_preds_test_all[[i]] <- data.frame( preds = outer_preds_test, true = y_outer_test )
+    outer_shaps_all[[i]] <- treeshap( fit_unify, X, verbose = FALSE )$shaps
     
   }
   
-  # Compile results; cross entropys and AUCs
-  ce_dat <- do.call( 'rbind', ce_list )
-  #auc_dat <- do.call( 'rbind', auc_list )
+  ### Visualise results
+  outer_preds_train_dat <- do.call( 'rbind', outer_preds_train_all )
+  outer_preds_test_dat <- do.call( 'rbind', outer_preds_test_all )
+  pred_label <- c( "None", "Exposure" )
+  outer_preds_train_dat$label <- factor( pred_label[outer_preds_train_dat$true + 1], pred_label )
+  outer_preds_test_dat$label <- factor( pred_label[outer_preds_test_dat$true + 1], pred_label )
+  outer_preds_train_dat$true <- NULL
+  outer_preds_test_dat$true <- NULL
   
-  ce_mean <- apply( ce_dat, 2, mean )
-  ce_se <- apply( ce_dat, 2, sd ) / sqrt( num_folds ) 
-  #auc_mean <- apply( auc_dat, 2, mean )
-  #auc_se <- apply( auc_dat, 2, sd ) / sqrt( num_folds )
-  
-  # Select best parameters based on whichever set minimised the CV error on average
-  best_ind <- which.min( ce_mean )
-  best_params <- all_param_grid[[best_ind]]
-  
-  # Create some diagnostic plots
-  png( 'CV_CE.png', width = 700, height = 600 )
-  cv_ce_plot <- ggplot( mapping = aes(x = 1:length(ce_mean), y = ce_mean) ) + geom_line() + 
-    geom_vline( xintercept = best_ind, linetype = 'dashed', col = 'red' ) +
-    ggtitle( paste0(num_folds, '-fold Cross Validation Cross-Entropy') ) + xlab( 'Index' ) + 
-    ylab( '' )
-  print( cv_ce_plot )
+  # Prediction vs Response
+  pdf( "Predicted_Probability_Train.pdf", height = 10, width = 10 )
+  plot( preds ~ label, data = outer_preds_train_dat, col = mycol, pch = 20, ylim = c(0, 1),
+        xlab = "", ylab = "", main = "Predicted Probability of Exposure (Training Set)" )
   dev.off()
   
-  #png( 'CV_AUC.png', width = 700, height = 600 )
-  #cv_auc_plot <- ggplot( mapping = aes(x = 1:length(auc_mean), y = auc_mean) ) + geom_line() + 
-  #  geom_vline( xintercept = best_ind, linetype = 'dashed', col = 'red' ) +
-  #  ggtitle( paste0(num_folds, '-fold Cross Validation AUC') ) + xlab( 'Index' ) + 
-  #  ylab( '' )
-  #print( cv_auc_plot )
-  #dev.off()
-  
-  # Save cross-validation results
-  write_csv( best_params, 'CV_chosen_parameters.csv' )
-  write_csv( data.frame(mean = ce_mean, se = ce_se), file = 'CV_CE.csv' )
-  #write_csv( data.frame(mean = auc_mean, se = auc_se), file = 'CV_AUC.csv' )
-  
-  cv_results <- list( cv_err_dat = ce_dat, 
-                      chosen_parameters = best_params, best_param_ind = best_ind,
-                      param_grid = all_param_grid, X = X, y = y )
-  
-  # Settings and initialization
-  train_prop <- 0.8
-  ncol_x <- ncol( X )
-  nrow_x <- nrow( X )
-  dim_x <- ncol_x * nrow_x
-  nms_x <- colnames( X )
-  avg_shaps <- matrix( 0, nrow = B, ncol = ncol_x )
-  all_auc <- matrix( 0, nrow = B, ncol = 2 )
-  all_train_inds <- all_fits <- train_rocs <- test_rocs <- train_preds <- test_preds <- list()
-  colnames( avg_shaps ) <- nms_x
-  colnames( all_auc ) <- c( 'Train', 'Test' )
-  train_num <- ceiling( nrow_x * train_prop )
-  test_num <- nrow_x - train_num
-  all_shaps <- data.frame( boot_ind = rep(1:B, each = nrow_x * ncol_x ), 
-                           variable = rep(rep(nms_x, each = nrow_x), B),
-                           obs_ind = rep(1:nrow_x, B * ncol_x),
-                           shap = 0 )
-  all_preds <- data.frame( boot_ind = rep(1:B, each = nrow_x),
-                           obs_ind = 0, train_ind = rep(c(rep(1, train_num), rep(0, test_num)), B), 
-                           pred = 0, true_val = 0 )
-  
-  # Run Repitiions
-  for ( i in 1:B ) {
-    
-    # Split into training / test sets
-    
-    train_inds <- createDataPartition( as.factor(y), p = train_prop, list = FALSE )
-    test_inds <- setdiff( 1:nrow_x, train_inds )
-    
-    preds_inds <- (((i-1)*nrow_x)+1):(i*nrow_x)
-    all_preds$obs_ind[preds_inds] <- c( train_inds, test_inds )
-    
-    X_train <- X[train_inds, ]
-    X_test <- X[test_inds, ]
-    y_train <- y[train_inds]
-    y_test <- y[test_inds]
-    
-    all_preds$true_val[preds_inds] <- c( y_train, y_test )
-    
-    if ( model_mode == 1 ) {
-      # XGBoost fit
-      train_xgb <- xgb.DMatrix( data = X_train, label = y_train )
-      test_xgb <- xgb.DMatrix( data = X_test, label = y_test )
-      fit <- all_fits[[i]] <- xgb.train( params = as.list(best_params[-nrounds_ind]), 
-                                         data = train_xgb, nrounds = best_params[[nrounds_ind]] )
-      preds_train <- predict( fit, newdata = X_train )
-      preds_test <- predict( fit, newdata = X_test )
-      fit_unify <- xgboost.unify( fit, X_train )
-    }
-    else {
-      # Random forest fit
-      fit <- all_fits[[i]] <- randomForest( x = X_train, y = factor(y_train), 
-                                            ntree = best_params$ntree, sampsize = best_params$sampsize,
-                                            nodesize = best_params$nodesize, mtry = best_params$mtry )
-      preds_train <- predict( fit, newdata = X_train, type = 'prob' )[, 2]
-      preds_test <- predict( fit, newdata = X_test, type = 'prob' )[, 2]
-      fit_unify <- randomForest2.unify( fit, X_train )
-    }
-    
-    # Predictions
-    all_preds$pred[preds_inds] <- c( preds_train, preds_test )
-    
-    # Shapley values
-    shap_X <- treeshap( fit_unify, X, verbose = FALSE )$shaps
-    shap_train <- treeshap( fit_unify, X_train, verbose = FALSE )$shaps
-    all_shaps$shap[(((i-1)*dim_x)+1):(i*dim_x)] <- unlist( shap_X )
-    avg_shaps[i, ] <- apply( shap_train, 2, function(x) { mean(abs(x)) } )
-    
-    # AUCs
-    train_rocs[[i]] <- roc( y_train, preds_train, direction = '<', quiet = TRUE )
-    test_rocs[[i]] <- roc( y_test, preds_test, direction = '<', quiet = TRUE )
-    all_auc[i, ] <- c( train = train_rocs[[i]]$auc,
-                       test = test_rocs[[i]]$auc )
-    
-  }
-  
-  # Compile results
-  shap_ranks <- t( apply( -avg_shaps, 1, rank ) )
-  rank_medians <- apply( shap_ranks, 2, quantile, probs = 0.5 )
-  
-  # Predictions plot
-  tru_val_lab <- c( 'Non-Exposed', 'Exposed' )
-  train_val_lab <- c( 'Train', 'Test' )
-  all_preds$true_lab <- factor( tru_val_lab[all_preds$true_val + 1], tru_val_lab )
-  all_preds$train_lab <- factor( rev(train_val_lab)[all_preds$train_ind + 1], train_val_lab )
-  
-  png( 'Repeated_Predictions.png', width = 700, height = 600 )
-  all_preds_plot <- ggplot( all_preds, aes( true_lab, pred, fill = train_lab ) ) + 
-    geom_boxplot( ) + scale_fill_manual( values = mycol, name = '' ) +
-    ylim(0, 1) + ggtitle( 'Predictions' ) + ylab( 'Prediction' ) + xlab( '' )
-  print( all_preds_plot )
+  pdf( "Predicted_Probability_Test.pdf", height = 10, width = 10 )
+  plot( preds ~ label, data = outer_preds_test_dat, col = mycol, pch = 20, ylim = c(0, 1),
+        xlab = "", ylab = "", main = "Predicted Probability of Exposure (Test Set)" )
   dev.off()
   
-  png( 'Repeated_AUC.png', width = 700, height = 600 )
-  all_auc_long <- pivot_longer( as.data.frame(all_auc), cols = all_of(train_val_lab) )
-  all_auc_long$name <- factor( all_auc_long$name, levels = train_val_lab )
-  boot_auc <- ggplot( all_auc_long, aes(name, value) ) + geom_boxplot( fill = mycol ) + ylim(0, 1) +
-    geom_hline( yintercept = 0.5, linetype = 'dashed', col = 'darkgrey' ) + ylab( 'AUC' ) + xlab( '' ) +
-    ggtitle( 'AUC' )
-  print( boot_auc )
+  # ROC curve
+  pdf( "ROC.pdf", height = 10, width = 10 )
+  roc_dat_train <- roc( label ~ preds, data = outer_preds_train_dat, direction = "<", quiet = TRUE )
+  roc_dat_test <- roc( label ~ preds, data = outer_preds_test_dat, direction = "<", quiet = TRUE )
+  plot( 1 - roc_dat_train$specificities, roc_dat_train$sensitivities, type = 'l', 
+        ylab = "Sensitivity", xlab = "False Positive Rate", main = "ROC Curve",
+        col = mycol[1], lwd = 2 )
+  lines( 1 - roc_dat_test$specificities, roc_dat_test$sensitivities, col = mycol[2], lwd = 2 )
+  abline( a = 0, b = 1, lty = 2, col = 'grey' )
+  text( 0.8, 0.2, paste0("Test AUC = ", round(roc_dat_test$auc, 2)), cex = 2, col = mycol[2] )
   dev.off()
   
-  # Shapley ranks plot
-  png( 'Repeated_Shap_Ranks.png', width = 700, height = 600 )
-  long_shap <- data.frame( var = rep(colnames(shap_ranks), each = B), 
-                           rank = unlist(as.data.frame(shap_ranks)) )
-  long_shap$var <- factor( long_shap$var, levels = colnames(shap_ranks)[order(rank_medians, decreasing = TRUE)] )
-  shap_joy <- ggplot( long_shap, aes( x = rank, y = var, fill = factor(ifelse(var=="random_num","Highlighted","Normal")) ) ) + 
-    scale_fill_manual(name = "var", values = rev(mycol)) + xlab( '' ) +
-    geom_density_ridges( ) + xlim( c(0, ncol(shap_ranks)) ) + theme( legend.position = 'none' )
-  print( shap_joy )
+  # Shapley geometric median
+  shap_dat <- shap_convert( outer_shaps_all )
+  shap_gmedian <- Gmedian( t(shap_dat[, 3:12]) ) %>% t
+  med_shap_list <- split( t(shap_gmedian), rep( 1:ncol(X), each = nrow(X) ) )
+  names( med_shap_list ) <- colnames( X )
+  shap_contrib <- do.call( 'cbind', med_shap_list ) %>% as.data.table
+  shap_long <- shap.prep( shap_contrib = shap_contrib, X_train = X )
+  shap_long_split <- split( shap_long, shap_long$variable )
+  shap_long$stdfvalue <- unlist( lapply( shap_long_split, function(x) { (rank(x$rfvalue)-1) / (nrow(x)-1) } ) )
+  s_plot <- shap.plot.summary( shap_long )
+  
+  pdf( "Shapley_All.pdf", height = 10, width = 10 )
+  print( s_plot )
   dev.off()
   
-  # Save and return results
-  repeated_results <- list( all_fits = all_fits, auc = all_auc, avg_shaps = avg_shaps, 
-                            all_shaps = all_shaps, shap_ranks = shap_ranks, 
-                            all_preds = all_preds, all_train_inds = all_train_inds,
-                            train_rocs = train_rocs, test_rocs = test_rocs )
+  # More condensed version
+  cutoff <- min( which( shap_long$variable == 'random_num' ) ) - 1
+  shap_long_trunc <- shap_long[1:cutoff, ]
+  shap_long_trunc$variable <- factor( shap_long_trunc$variable )
+  s_plot_trunc <- shap.plot.summary( shap_long_trunc )
   
-  res <- list( cv_results = cv_results, repeated_results = repeated_results )
+  pdf( "Shapley.pdf", height = 10, width = 10 )
+  print( s_plot_trunc )
+  dev.off()
+  
+  ### Save chosen parameter data
+  best_params_dat <- do.call( 'rbind', best_params_all )
+  best_params_dat$param_grid_ind <- rownames( best_params_dat )
+  write_csv( best_params_dat, 'Chosen_Parameters.csv' )
+  
+  ### Save results
+  res <- list( accuracy_train = outer_preds_train_dat, accuracy_test = outer_preds_test_dat, 
+               shaps = outer_shaps_all, chosen_parameters = best_params_dat )
   save( res, file = 'res.Rdata' )
   setwd( '..' )
   
@@ -323,19 +351,18 @@ fit_fun <- function( X, y, param_grid, model_mode = 1, num_folds, B = 1000, seed
 
 ### Load and prepare data
 hd_bsi <- read_csv( 'Data/hd_bsi.csv' )
-X <- select( hd_bsi, -Exposure ) %>% as.matrix
+X <- select( hd_bsi, -Exposure, -status ) %>% as.matrix
 y <- hd_bsi$Exposure
-num_folds <- nrow( X )
 
 # XGBoost
-param_grid_xgb <- list( max_depth = c(1, 3, 5), eta = c(0.01, 0.05, 0.1),
-                        gamma = c(1, 5, 10), subsample = c(0.5, 0.8), 
-                        colsample_bytree = c(0.5, 0.8),
-                        lambda = c(0.1, 0.9), objective = 'binary:logistic', 
-                        nrounds = c(10, 50, 100) )
+param_grid_xgb <- list( max_depth = c(3, 5), eta = c(0.001, 0.01, 0.1),
+                        gamma = c(3, 5), subsample = c(0.5, 0.8), 
+                        colsample_bytree = c(0.5, 0.8), min_child_weight = c(3, 5),
+                        lambda = c(1, 3, 5), objective = 'binary:logistic', 
+                        nrounds = c(10, 50) )
 
 # Random forest
-sampsize <- (nrow( X ) * c( 0.5, 0.8 ) * 0.8) %>% round
+sampsize <- ( nrow(X) * c(0.5, 0.8) * 0.8 ) %>% round
 param_grid_rf <- list( ntree = c(10, 50, 100), sampsize = sampsize,
                        mtry = c(4, 6, 8), nodesize = c(1, 3, 5) )
 
@@ -347,11 +374,12 @@ setwd( home_dir )
 ### Run model fit functions
 # XGBoost
 tic()
-fit_fun( X, y, model_mode = 1, param_grid = param_grid_xgb, num_folds = num_folds, seed = 42 )
-xgb_time <- toc() # 3564.518 sec elapsed
+fit_fun( X, y, model_mode = 1, param_grid = param_grid_xgb, outer_folds = nrow(X), 
+         inner_folds = 10, seed = 42 )
+xgb_time <- toc() # 17370.853 sec elapsed
 
 # Random Forest
-tic()
-fit_fun( X, y, model_mode = 2, param_grid = param_grid_rf, num_folds = num_folds, seed = 42 )
-rf_time <- toc() # 219.495 sec elapsed
+#tic()
+#fit_fun( X, y, model_mode = 2, param_grid = param_grid_rf, num_folds = num_folds, seed = 42 )
+#rf_time <- toc() # 219.495 sec elapsed
 

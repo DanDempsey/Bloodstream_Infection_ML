@@ -1,4 +1,4 @@
-##### Data cleaning and visualisation of hemodialysis (HD) and bloodstream infection (BSI) data
+##### Data Cleaning and Visualisation of Hemodialysis (HD) and Bloodstream Infection (BSI) Data
 ##### Daniel Dempsey
 
 ### Setting up
@@ -9,15 +9,20 @@ library( dplyr ) # Data frame manipulation tools
 library( caret ) # Used for easy one-hot encoding
 library( stringi ) # Used when cleaning column names
 library( corrplot ) # For visualising correlations
-library( mice ) # Missing value imputation
 library( ggforce ) # Sina plots
 library( ggpubr ) # For placing multiple graphs on the same plot
 library( naniar ) # Missing data plots
 library( ggcorrplot ) # Correlation matrix plots
-mycol <- c( '#56B4E9', '#E69F00' )
+mycol <- c( '#56B4E9', '#E69F00', '#6bb03d' )
 
 ### Utility function: make directories if they don't already exist
-mkdir <- function( x ) {
+mkdir <- function( x, safe = TRUE, safe_dir = 'HD_BSI' ) {
+  if ( safe ) {
+    where_now <- sub( ".*/", "", getwd() )
+    if ( where_now != safe_dir ) {
+      stop( paste0("You are trying to create a folder where you don't want to! Move to the ", safe_dir, " directory.") )
+    }
+  }
   dir_split <- strsplit( x, '/' )[[1]]
   current_dir <- ''
   for ( i in 1:length(dir_split) ) {
@@ -31,7 +36,8 @@ mkdir( 'Output/Data_Visualisations' )
 
 ### Read in data, perform initial cleaning and make column names consistent
 ### Clinic data
-hd_raw <- read_xlsx( 'Data/HD-180 - FACS and excel matching -Feb 2023.xlsx', skip = 4, sheet = 'US & 3 antigens pooled' )
+hd_raw <- read_xlsx( 'Data/HD-180 - FACS and excel matching -Feb 2023.xlsx', 
+                     skip = 4, sheet = 'US & 3 antigens pooled' )
 
 # Two columns list study numbers; check that they are consistent
 all( hd_raw$StudyNo...1 == hd_raw$StudyNo...34 ) # All TRUE
@@ -86,13 +92,21 @@ clean_cols <- function( x ) {
 
 bsi_names <- clean_cols( bsi_names_raw )
 colnames( bsi_dat_raw ) <- bsi_names
-bsi <- bsi_dat_raw
+bsi_no_mod <- bsi_dat_raw
+
+# Add in Months on Dialysis data
+mod_dat <- read_xlsx( 'Data/Book 2.xlsx', range = 'A3:E28' ) %>% 
+  select( 'ID for ML analysis', 'MonthsSinceStartingDialysis' )
+
+colnames( mod_dat )[1] <- 'IDforMLanalysis'
+
+bsi <- merge( bsi_dat_raw, mod_dat, by = 'IDforMLanalysis' )
 
 # Fix mistake in the dataset with one of the Transplant Ever values
 bsi$TransplantEver[bsi$StudyNo == "CKD032-BSI(1)"] <- 0
 
 # Fix study ID
-colnames( bsi )[2] <- 'StudyNumber'
+colnames( bsi )[1] <- 'StudyNumber'
 bsi$Infection <- regmatches( bsi$StudyNumber, gregexpr("(?<=\\().*?(?=\\))", bsi$StudyNumber, perl = T) ) %>% 
   unlist %>% as.numeric
 bsi$StudyNumber <- sub( '-.*', '', bsi$StudyNumber )
@@ -129,6 +143,7 @@ hd_bsi <- hd_bsi_raw
 # Drop unstimulated and non-corrected variables
 drop_names <- c( "CD4Unstim", "CD4HKPS80", "CD4HKMRSA", "CD4HKMSSA", 
                  "MemCD4Unstim", "MemCD4HKPS80", "MemCD4HKMRSA", "MemCD4HKMSSA",
+                 "DivMemCD4HKPS80", "DivMemCD4HKMRSA", "DivMemCD4HKMSSA",
                  "IL10Unstim", "Th17Unstim", "TransTh17Unstim", "Th1Unstim", "exTh17Unstim" )
 hd_bsi <- select( hd_bsi_raw, -all_of(drop_names) )
 
@@ -300,7 +315,7 @@ final_dat$random_num <- abs( rnorm(nrow(final_dat)) )
 final_dat$Exposure <- ifelse( final_dat$status == 'Current Exposure', 1, 0 )
 
 ### Plot response data
-expose_dat <- as.data.frame( table( final_dat$Exposure ) )
+expose_dat <- as.data.frame( table( final_dat$status ) )
 
 exposure_plot <- ggplot( expose_dat, aes( x = Var1, y = Freq ) ) +
   geom_bar(stat="identity", fill=mycol)+
@@ -338,7 +353,7 @@ a_nms <- c('Chronic Glomerulonephritis', 'Ischaemic Nephrology',
 cat_list[[5]]$AetiologyofCKD <- rep( a_nms, 2 )
 cat_list[[5]]$AetiologyofCKD <- factor( cat_list[[5]]$AetiologyofCKD, levels = a_nms )
 
-mkdir( 'Categorical_Barplots' )
+mkdir( 'Categorical_Barplots', safe_dir = 'Data_Visualisations' )
 for( i in 1:length(cat_list) ) {
   
   nm <- colnames( cat_list[[i]] )[1]
@@ -365,7 +380,7 @@ num_dat$Exposure <- factor( num_dat$Exposure )
 group_cols <- mycol
 use_cols <- group_cols[ match( num_dat$Exposure, c( 1, 0 ) ) ]
 
-mkdir( 'Numerical_Violins' )
+mkdir( 'Numerical_Violins', safe_dir = 'Data_Visualisations' )
 set.seed( 1010 )
 for ( i in 1:ncol( num_dat )  ) {
   
@@ -384,12 +399,8 @@ for ( i in 1:ncol( num_dat )  ) {
 }
 
 ### Remove redundant columns
-drop_final <- c( "StudyNumber", "VascularAccess", "AetiologyofCKD", "status" )
-final_dat_trim <- select( final_dat, -all_of(drop_final) )
-
-### Missing value imputation
-set.seed( 987 )
-final_dat_complete <- complete( mice(final_dat_trim) )
+drop_final <- c( "StudyNumber", "VascularAccess", "AetiologyofCKD" )
+final_dat_complete <- select( final_dat, -all_of(drop_final) )
 
 ### Write final data to file
 write_csv( final_dat_complete, '../../Data/hd_bsi.csv' )
