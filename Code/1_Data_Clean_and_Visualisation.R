@@ -26,7 +26,7 @@ mkdir <- function( x, safe = TRUE, safe_dir = 'HD_BSI' ) {
   dir_split <- strsplit( x, '/' )[[1]]
   current_dir <- ''
   for ( i in 1:length(dir_split) ) {
-    current_dir <- paste0(current_dir, dir_split[i], sep = '/')
+    current_dir <- paste0( current_dir, dir_split[i], sep = '/' )
     if( !dir.exists( current_dir ) ) {
       dir.create( current_dir )
     }

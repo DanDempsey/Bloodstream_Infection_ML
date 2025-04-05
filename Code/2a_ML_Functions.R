@@ -29,7 +29,7 @@ mkdir <- function( x, safe = TRUE, safe_dir = 'HD_BSI' ) {
   dir_split <- strsplit( x, '/' )[[1]]
   current_dir <- ''
   for ( i in 1:length(dir_split) ) {
-    current_dir <- paste0(current_dir, dir_split[i], sep = '/')
+    current_dir <- paste0( current_dir, dir_split[i], sep = '/' )
     if( !dir.exists( current_dir ) ) {
       dir.create( current_dir )
     }
@@ -211,8 +211,7 @@ fit_fun <- function( X, y, param_grid, model_mode = 1, outer_folds = nrow(X),
     all_test_preds <- matrix( 0, nrow = inner_folds, ncol = nrow(all_param_grid) )
     for ( j in 1:inner_folds ) {
       
-      #print( paste0("i = ", i, ", j = ", j) )
-      #if ( (i == 2) & (j == 2) ) { browser() }
+      # Dynamic imputation
       X_imp_inner <- dynamic_pmm( X_outer_train, inner_fold_inds[[j]] )
       
       # Create inner sets
