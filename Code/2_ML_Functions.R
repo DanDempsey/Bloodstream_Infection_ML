@@ -386,13 +386,15 @@ fit_fun <- function( X, y, param_grid, model_mode = 1, outer_folds = nrow(X),
     
     # More condensed version
     cutoff <- min( which( shap_long$variable == 'random_num' ) ) - 1
-    shap_long_trunc <- shap_long[1:cutoff, ]
-    shap_long_trunc$variable <- factor( shap_long_trunc$variable )
-    s_plot_trunc <- shap.plot.summary( shap_long_trunc )
-    
-    pdf( "Shapley.pdf", height = 10, width = 10 )
-    print( s_plot_trunc )
-    dev.off()
+    if ( cutoff > 0 ) {
+      shap_long_trunc <- shap_long[1:cutoff, ]
+      shap_long_trunc$variable <- factor( shap_long_trunc$variable )
+      s_plot_trunc <- shap.plot.summary( shap_long_trunc )
+      
+      pdf( "Shapley.pdf", height = 10, width = 10 )
+      print( s_plot_trunc )
+      dev.off()
+    }
   }
   else {
     var_shrink <- lapply( outer_shaps_all, function(x) { !(x == 0) } ) %>% 
